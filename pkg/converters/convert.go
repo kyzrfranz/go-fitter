@@ -2,19 +2,13 @@ package converters
 
 import (
 	"fmt"
-	"os"
+	"io"
 
 	cJson "github.com/kyzrfranz/go-fitter/pkg/converters/json"
 	"github.com/muktihari/fit/decoder"
 )
 
-func FitToJson(path string, decoderOptions []decoder.Option, opts ...cJson.Option) (string, error) {
-	ff, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("open file: %s: %w", path, err)
-	}
-	defer ff.Close()
-
+func FitToJson(ff io.Reader, decoderOptions []decoder.Option, opts ...cJson.Option) (string, error) {
 	// We don't need a bufio.Writer, json.Marshal writes it all at once at the end
 	conv := cJson.NewFITToJSONConv(opts...) // Use the new converter
 
@@ -27,6 +21,7 @@ func FitToJson(path string, decoderOptions []decoder.Option, opts ...cJson.Optio
 	options = append(options, decoderOptions...)
 	dec := decoder.New(ff, options...)
 
+	var err error
 	for dec.Next() {
 		_, err = dec.Decode()
 		if err != nil {

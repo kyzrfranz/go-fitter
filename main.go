@@ -2,77 +2,39 @@ package main
 
 import (
 	"flag"
-	"fmt"
+	"log/slog"
 	"os"
-	"path/filepath"
 
-	"github.com/kyzrfranz/go-fitter/pkg/converters"
-	cJson "github.com/kyzrfranz/go-fitter/pkg/converters/json"
-	"github.com/muktihari/fit/decoder"
+	"github.com/kyzrfranz/go-fitter/internal/args"
+	"github.com/kyzrfranz/go-fitter/internal/http"
+	"github.com/kyzrfranz/go-fitter/internal/rest"
+)
+
+var (
+	logger     *slog.Logger
+	serverPort = 0
 )
 
 func main() {
-	test()
-}
 
-func test() {
-	var printOnlyValidValue bool
-	flag.BoolVar(&printOnlyValidValue, "valid", false, "Print only valid value")
-
-	var printDegrees bool
-	flag.BoolVar(&printDegrees, "deg", false, "Print GPS position (Lat & Long) in degrees instead of semicircles")
-
-	var noExpand bool
-	flag.BoolVar(&noExpand, "no-expand", false, "[Decode Option] Do not expand components")
-
-	var noChecksum bool
-	flag.BoolVar(&noChecksum, "no-checksum", false, "[Decode Option] should not do crc checksum")
-
-	var noRecords bool
-	flag.BoolVar(&noRecords, "no-records", false, "Exclude the high-resolution 'records' array from the JSON output")
+	flag.IntVar(&serverPort, "port", args.EnvOrDefault[int]("SERVER_PORT", 8080), "Port for the API server")
 
 	flag.Parse()
 
-	var decoderOptions []decoder.Option
-	if noExpand {
-		decoderOptions = append(decoderOptions, decoder.WithNoComponentExpansion())
-	}
-	if noChecksum {
-		decoderOptions = append(decoderOptions, decoder.WithIgnoreChecksum())
-	}
+	logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	apiServer := http.NewApiServer(serverPort, logger)
 
-	var jsonOpts []cJson.Option
-	// Add existing options (like -deg, --valid)
-	if printDegrees {
-		jsonOpts = append(jsonOpts, cJson.WithPrintGPSPositionInDegrees())
-	}
-	if printOnlyValidValue {
-		jsonOpts = append(jsonOpts, cJson.WithPrintOnlyValidValue())
-	}
+	apiServer.Use(http.MiddlewareRecovery)
+	apiServer.Use(http.MiddlewareCORS)
+	apiServer.Use(http.MiddlewareLogging(logger))
 
-	// Add the new option
-	if noRecords {
-		jsonOpts = append(jsonOpts, cJson.WithNoRecords())
-	}
+	setupHandlers(apiServer)
 
-	paths := flag.Args()
+	apiServer.Start()
+}
 
-	if len(paths) == 0 {
-		panic("missing file argument, e.g.: fitconv Activity.fit\n")
-	}
+func setupHandlers(apiServer *http.ApiServer) {
+	handler := rest.NewHandler(logger)
 
-	for _, path := range paths {
-		ext := filepath.Ext(path)
-		switch ext {
-		case ".fit":
-			msg, err := converters.FitToJson(path, decoderOptions, jsonOpts...)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "could not convert %q to json: %v\n", path, err)
-			}
-
-			fmt.Fprintf(os.Stdout, "%s\n", msg)
-		default:
-			fmt.Fprintf(os.Stderr, "unrecognized format: %s\n", ext)
-		}
-	}
+	apiServer.AddHandler("/fit", handler.Fit)
 }
