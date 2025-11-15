@@ -27,6 +27,10 @@ go.work.sum
 # env file
 .env
 
+example/swim.fit
+example/bike.fit
+example/run.fit
+
 # Editor/IDE
  .idea/**
 # .vscode/
