@@ -1,0 +1,37 @@
+// MongoDB setup for go-fitter.
+// Paste into mongosh, or: mongosh "$MONGO_URI" < config/db/setup.mongosh
+
+use fitter
+
+db.createCollection("activities", {
+  storageEngine: { wiredTiger: { configString: "block_compressor=zstd" } },
+  writeConcern:  { w: "majority" }
+})
+
+db.createCollection("health", {
+  storageEngine: { wiredTiger: { configString: "block_compressor=zstd" } },
+  writeConcern:  { w: "majority" }
+})
+
+// activities indexes
+db.activities.createIndex({ sport: 1, start_time: -1 })
+db.activities.createIndex({ start_time: -1 })
+// A multisport (triathlon) file produces several activities (swim, bike, run)
+// that all share one file_hash, so this MUST NOT be unique. Idempotent
+// re-imports are guaranteed by the deterministic per-leg _id instead. The index
+// stays for "find all legs of a file" lookups.
+db.activities.createIndex(
+  { "source.file_hash": 1 },
+  { sparse: true, name: "source_file_hash" }
+)
+db.activities.createIndex(
+  { "meta.title": "text", "meta.description": "text" },
+  { default_language: "english", name: "meta_text" }
+)
+
+// health indexes
+db.health.createIndex(
+  { name: 1, date: 1 },
+  { unique: true, name: "name_date_unique" }
+)
+db.health.createIndex({ date: 1 })
