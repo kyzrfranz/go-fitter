@@ -7,7 +7,7 @@ func defaultOptions() *options {
 	return &options{
 		channelBufferSize:         1000,
 		useRawValue:               false,
-		printOnlyValidValue:       false,
+		printOnlyValidValue:       true,
 		printGPSPositionInDegrees: false,
 		prettyPrint:               true,
 		noRecords:                 false,

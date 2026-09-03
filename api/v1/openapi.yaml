@@ -1,0 +1,548 @@
+openapi: 3.1.0
+info:
+  title: go-fitter API
+  description: |
+    Unified API over ingested .FIT activities and Apple HealthKit data.
+    Activities come from .FIT files (via Dropbox/folder retrievers or the REST
+    upload), health metrics come from HealthKit exports. The LLM context
+    endpoint composes both into a single day-keyed timeline.
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+paths:
+  /health:
+    get:
+      summary: List health metrics
+      description: |
+        Returns health metric samples grouped by metric name. If `from` is not
+        supplied, defaults to the last 7 days to avoid scanning the full history.
+      operationId: listHealth
+      parameters:
+        - $ref: '#/components/parameters/HealthMetricName'
+        - $ref: '#/components/parameters/HealthMetricAlias'
+        - $ref: '#/components/parameters/HealthFrom'
+        - $ref: '#/components/parameters/HealthTo'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Sort'
+      responses:
+        '200':
+          description: Map of metric name to aggregated series.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/HealthMetricSeries'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /activities:
+    get:
+      summary: List activities
+      operationId: listActivities
+      parameters:
+        - $ref: '#/components/parameters/Sport'
+        - $ref: '#/components/parameters/ActivityFrom'
+        - $ref: '#/components/parameters/ActivityTo'
+        - $ref: '#/components/parameters/Title'
+        - $ref: '#/components/parameters/ActivityType'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Activities sorted by start_time descending.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Activity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /activities/{id}:
+    get:
+      summary: Get a single activity
+      operationId: getActivity
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Activity id (first 16 hex chars of the .FIT sha256).
+          schema:
+            type: string
+        - name: withRecords
+          in: query
+          description: When present, the response includes the per-sample `records` array.
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Activity payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Activity'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /activities/{id}/series:
+    get:
+      summary: Get a time-series view of an activity
+      description: |
+        Re-reads the raw .FIT from the configured retriever and projects the
+        record stream into parallel arrays keyed by field name. `time` is always
+        included as the x-axis and expressed as seconds since `start_time` when
+        the activity has one (otherwise unix seconds).
+      operationId: getActivitySeries
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: fields
+          in: query
+          description: |
+            Comma-separated list of fields to project. Defaults to
+            `time,hr,power,cadence,speed,altitude`. Unknown names are looked up
+            verbatim against the record map.
+          schema:
+            type: string
+          example: time,hr,power
+      responses:
+        '200':
+          description: Series payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeriesResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: Activity has no `source.path`, so the raw file cannot be located.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '502':
+          description: Upstream retriever failed to read the raw file.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '503':
+          description: No retriever configured on the server.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /llm-context:
+    get:
+      summary: Day-keyed activity + health context for LLM prompts
+      description: |
+        Defaults to the trailing 7 days. Activity filters from `/activities` are
+        accepted and forwarded to the activity lookup.
+      operationId: getLLMContext
+      parameters:
+        - name: from
+          in: query
+          description: Start date (YYYY-MM-DD). Defaults to 7 days before `to`.
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          description: End date (YYYY-MM-DD). Defaults to today.
+          schema:
+            type: string
+            format: date
+        - $ref: '#/components/parameters/Sport'
+        - $ref: '#/components/parameters/Title'
+        - $ref: '#/components/parameters/ActivityType'
+      responses:
+        '200':
+          description: Composed timeline.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMContextResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  parameters:
+    Sport:
+      name: sport
+      in: query
+      description: Filter activities by sport (exact match, e.g. `running`).
+      schema:
+        type: string
+    ActivityFrom:
+      name: from
+      in: query
+      description: Inclusive lower bound on `start_time`. Accepts RFC3339 or `YYYY-MM-DD`.
+      schema:
+        type: string
+    ActivityTo:
+      name: to
+      in: query
+      description: Inclusive upper bound on `start_time`. Accepts RFC3339 or `YYYY-MM-DD`.
+      schema:
+        type: string
+    Title:
+      name: title
+      in: query
+      description: Case-insensitive regex match against `meta.title`.
+      schema:
+        type: string
+    ActivityType:
+      name: activity_type
+      in: query
+      description: Exact match against `meta.activity_type`.
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      description: Page size. Defaults to 50 for activities; unlimited for health.
+      schema:
+        type: integer
+        minimum: 1
+    Skip:
+      name: skip
+      in: query
+      description: Pagination offset.
+      schema:
+        type: integer
+        minimum: 0
+    Sort:
+      name: sort
+      in: query
+      description: Sort key, prefix with `-` for descending. Defaults to `date` ascending.
+      schema:
+        type: string
+      example: -date
+    HealthMetricName:
+      name: name
+      in: query
+      description: Filter to a single health metric (e.g. `resting_heart_rate`).
+      schema:
+        type: string
+    HealthMetricAlias:
+      name: metric
+      in: query
+      description: Alias for `name`. `name` wins when both are set.
+      schema:
+        type: string
+    HealthFrom:
+      name: from
+      in: query
+      description: Inclusive lower bound on `date` (`YYYY-MM-DD`). Defaults to 7 days ago.
+      schema:
+        type: string
+        format: date
+    HealthTo:
+      name: to
+      in: query
+      description: Inclusive upper bound on `date` (`YYYY-MM-DD`).
+      schema:
+        type: string
+        format: date
+
+  responses:
+    InternalError:
+      description: Unhandled server error.
+      content:
+        text/plain:
+          schema:
+            type: string
+    NotFound:
+      description: Resource not found.
+      content:
+        text/plain:
+          schema:
+            type: string
+
+  schemas:
+    Activity:
+      type: object
+      properties:
+        id:
+          type: string
+          description: First 16 hex chars of the source .FIT sha256.
+        sport:
+          type: string
+        sub_sport:
+          type: string
+        start_time:
+          type: string
+          format: date-time
+        laps:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        sessionSummary:
+          type: object
+          additionalProperties: true
+        sportMesg:
+          type: object
+          additionalProperties: true
+        records:
+          type: array
+          description: Per-sample stream. Only returned when explicitly requested.
+          items:
+            type: object
+            additionalProperties: true
+        meta:
+          $ref: '#/components/schemas/ActivityMeta'
+        source:
+          $ref: '#/components/schemas/Source'
+        custom:
+          $ref: '#/components/schemas/Custom'
+
+    ActivityMeta:
+      type: object
+      properties:
+        title:
+          type: string
+          description: Defaults to `<sport> <YYYY-MM-DD>` when no sidecar meta is supplied.
+        description:
+          type: string
+        source:
+          type: string
+
+    Source:
+      type: object
+      properties:
+        vendor:
+          type: string
+        provider:
+          type: string
+          description: Where the file came from (`dropbox`, `folder`, ...).
+        path:
+          type: string
+        file_hash:
+          type: string
+          description: sha256 of the raw .FIT bytes.
+        ingest_time:
+          type: string
+          format: date-time
+
+    Custom:
+      type: object
+      description: Derived metrics computed at ingest time.
+      properties:
+        efficiency:
+          type: number
+          format: double
+        max_hr:
+          type: number
+          format: double
+        avg_hr:
+          type: number
+          format: double
+        avg_pwr:
+          type: number
+          format: double
+        avg_speed:
+          type: number
+          format: double
+        total_time:
+          type: number
+          format: double
+        total_distance:
+          type: number
+          format: double
+        normalized_power:
+          type: number
+          format: double
+        decoupling:
+          type: number
+          format: double
+        pacing_trend:
+          type: string
+
+    HealthMetricSeries:
+      type: object
+      properties:
+        name:
+          type: string
+        units:
+          type: string
+        samples:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    SeriesResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        sample_count:
+          type: integer
+        start_time:
+          type: string
+          format: date-time
+        fields:
+          type: array
+          items:
+            type: string
+        data:
+          type: object
+          description: Parallel arrays keyed by field name. `null` slots mark missing samples.
+          additionalProperties:
+            type: array
+            items:
+              nullable: true
+
+    LLMContextResponse:
+      type: object
+      properties:
+        context_window:
+          type: string
+          example: 2026-05-04 to 2026-05-11
+        total_training_load:
+          type: integer
+        activity_count:
+          type: integer
+        timeline:
+          type: array
+          items:
+            $ref: '#/components/schemas/DailyContext'
+
+    DailyContext:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        activities:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActivityContext'
+        health:
+          $ref: '#/components/schemas/HealthContext'
+
+    ActivityContext:
+      type: object
+      properties:
+        date:
+          type: string
+        type:
+          type: string
+        duration:
+          type: string
+        distance:
+          type: string
+        avg_hr:
+          type: integer
+        max_hr:
+          type: integer
+        avg_pwr:
+          type: integer
+        norm_pwr:
+          type: integer
+        efficiency_factor:
+          type: number
+          format: double
+        decoupling:
+          type: number
+          format: double
+        pacing:
+          type: string
+        intensity_zone:
+          type: string
+        laps:
+          type: array
+          items:
+            $ref: '#/components/schemas/Lap'
+
+    HealthContext:
+      type: object
+      properties:
+        sleep_hours:
+          type: number
+          format: double
+        hrv:
+          type: integer
+        rhr:
+          type: integer
+        weight:
+          type: number
+          format: double
+        active_cals:
+          type: integer
+
+    Lap:
+      type: object
+      properties:
+        Lap Power:
+          type: integer
+        avg_form_power:
+          type: number
+          format: double
+        avg_fractional_cadence:
+          type: number
+          format: double
+        avg_garmin_step_length:
+          type: number
+          format: double
+        avg_garmin_vertical_ratio:
+          type: number
+          format: double
+        avg_heart_rate:
+          type: integer
+        avg_leg_spring_stiffness:
+          type: number
+          format: double
+        avg_power:
+          type: integer
+        avg_running_cadence:
+          type: integer
+        avg_speed:
+          type: number
+          format: double
+        avg_step_length:
+          type: number
+          format: double
+        avg_stryd_power:
+          type: number
+          format: double
+        avg_temperature:
+          type: integer
+        max_heart_rate:
+          type: integer
+        max_power:
+          type: integer
+        max_speed:
+          type: number
+          format: double
+        max_temperature:
+          type: integer
+        min_temperature:
+          type: integer
+        normalized_power:
+          type: integer
+        swim_stroke:
+          type: integer
+        total_ascent:
+          type: integer
+        total_descent:
+          type: integer
+        total_distance:
+          type: integer
+        total_elapsed_time:
+          type: number
+          format: double
+        total_moving_time:
+          type: number
+          format: double

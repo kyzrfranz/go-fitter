@@ -14,6 +14,7 @@ import (
 	"github.com/muktihari/fit/profile"
 	"github.com/muktihari/fit/profile/basetype"
 	"github.com/muktihari/fit/profile/mesgdef"
+	"github.com/muktihari/fit/profile/typedef"
 	"github.com/muktihari/fit/profile/untyped/mesgnum"
 	"github.com/muktihari/fit/proto"
 )
@@ -49,7 +50,7 @@ type options struct {
 	printOnlyValidValue       bool // Print only valid value
 	printGPSPositionInDegrees bool // Print latitude and longitude in degrees instead of semicircles.
 	prettyPrint               bool // Pretty-print the final JSON output
-	noRecords                 bool // Add --no-records flag
+	noRecords                 bool // Skip Records as they blow up size
 }
 
 // NewFITToJSONConv creates a new FIT to JSON converter.
@@ -146,7 +147,7 @@ func (c *Converter) buildMessageMap(mesg proto.Message) map[string]any {
 		baseType := field.BaseType
 
 		// Check for subfield substitution
-		if subField := field.SubFieldSubtitution(&mesg); subField != nil { // Uses 'mesg'
+		if subField := field.SubFieldSubstitution(&mesg); subField != nil { // Uses 'mesg'
 			name = subField.Name
 			units = subField.Units
 			scale = subField.Scale
@@ -221,7 +222,12 @@ func (c *Converter) buildMessageMap(mesg proto.Message) map[string]any {
 			switch profileType {
 			case profile.DateTime, profile.LocalDateTime:
 				finalValue = datetime.ToTime(value.Uint32()).Format(time.RFC3339)
+			case profile.Sport:
+				finalValue = typedef.Sport(value.Uint8()).String()
+			case profile.SubSport:
+				finalValue = typedef.SubSport(value.Uint8()).String()
 			}
+
 			if value.Type() == proto.TypeString {
 				finalValue = value.String()
 			}
@@ -285,41 +291,59 @@ func (c *Converter) Result() string {
 	return c.result
 }
 
-// marshalAndWrite collates all processed data and writes it as a single JSON object.
+// leg is one session together with the records and laps that fall inside its
+// time window. A single-sport file has exactly one leg; a multisport (triathlon)
+// file has one per session (swim, T1, bike, T2, run).
+type leg struct {
+	session map[string]any
+	records []map[string]any
+	laps    []map[string]any
+}
+
+// marshal collates the decoded messages into one JSON object per non-transition
+// session ("leg") and emits them as a JSON array. A normal single-sport file
+// yields a one-element array. Transition sessions (sport == "transition") are
+// dropped along with the records/laps that fall in their window, so they can't
+// corrupt an adjacent leg.
 func (c *Converter) marshal() string {
 	if c.err != nil { // Check for earlier processing errors
 		return ""
 	}
 
-	c.enrichLaps()
+	legs := c.partitionLegs()
 
-	// Collate all data into the final coach-friendly structure
-	finalData := make(map[string]any)
+	out := make([]map[string]any, 0, len(legs))
+	for i := range legs {
+		l := legs[i]
+		sport := getString(l.session, "sport")
+		if sport == "transition" {
+			continue // transitions are not real legs; their records/laps are dropped
+		}
 
-	// We only expect one session and one sport message
-	if len(c.sessionMessages) > 0 {
-		finalData["sessionSummary"] = c.sessionMessages[0]
+		// Enrich this leg's laps using only this leg's records.
+		c.enrichLaps(l.session, l.laps, l.records, sport)
+
+		finalData := map[string]any{
+			"sessionSummary": l.session,
+			"laps":           l.laps,
+		}
+		if sm := c.sportMessageFor(sport); sm != nil {
+			finalData["sportMesg"] = sm
+		}
+		// Use --no-records to get a small, clean file.
+		if !c.options.noRecords {
+			finalData["records"] = l.records
+		}
+		out = append(out, finalData)
 	}
-	if len(c.sportMessages) > 0 {
-		finalData["sport"] = c.sportMessages[0]
-	}
 
-	// This 'c.lapMessages' slice now contains the ENRICHED laps
-	finalData["laps"] = c.lapMessages
-
-	// This check is from our previous step.
-	// Use --no-records to get a small, clean file.
-	if !c.options.noRecords {
-		finalData["records"] = c.recordMessages
-	}
-
-	// Marshal to JSON
+	// Marshal to JSON (always an array, even for a single leg).
 	var jsonData []byte
 	var err error
 	if c.options.prettyPrint {
-		jsonData, err = json.MarshalIndent(finalData, "", "  ")
+		jsonData, err = json.MarshalIndent(out, "", "  ")
 	} else {
-		jsonData, err = json.Marshal(finalData)
+		jsonData, err = json.Marshal(out)
 	}
 	if err != nil {
 		c.err = fmt.Errorf("marshal json: %w", err)
@@ -327,6 +351,91 @@ func (c *Converter) marshal() string {
 	}
 
 	return string(jsonData)
+}
+
+// partitionLegs splits the global record and lap streams across the sessions by
+// time. Each record/lap is assigned to the session with the latest start_time
+// that is still <= its own timestamp. Sessions arrive in file (chronological)
+// order, so this partitions the timeline with no overlap and nothing
+// double-counted: a record in a transition window lands on the transition
+// session and is later dropped, never leaking into the swim/bike/run legs.
+func (c *Converter) partitionLegs() []leg {
+	legs := make([]leg, len(c.sessionMessages))
+	starts := make([]time.Time, len(c.sessionMessages))
+	for i, s := range c.sessionMessages {
+		legs[i] = leg{session: s}
+		if t, ok := parseTime(s, "start_time"); ok {
+			starts[i] = t
+		}
+	}
+
+	// assign returns the index of the owning session for timestamp t, or -1.
+	assign := func(t time.Time) int {
+		idx := -1
+		for i := range starts {
+			if starts[i].IsZero() {
+				continue
+			}
+			if !t.Before(starts[i]) { // t >= start_i; later sessions start later, so last match wins
+				idx = i
+			}
+		}
+		if idx == -1 && len(legs) > 0 {
+			idx = 0 // a stray record before the first session folds into the first leg
+		}
+		return idx
+	}
+
+	for _, rec := range c.recordMessages {
+		t, ok := parseTime(rec, "timestamp")
+		if !ok {
+			continue
+		}
+		if i := assign(t); i >= 0 {
+			legs[i].records = append(legs[i].records, rec)
+		}
+	}
+	for _, lap := range c.lapMessages {
+		t, ok := parseTime(lap, "start_time")
+		if !ok {
+			continue
+		}
+		if i := assign(t); i >= 0 {
+			legs[i].laps = append(legs[i].laps, lap)
+		}
+	}
+	return legs
+}
+
+// sportMessageFor returns the sport message whose "sport" matches the leg's
+// sport, or nil. Multisport files carry one sport message per leg.
+func (c *Converter) sportMessageFor(sport string) map[string]any {
+	for _, sm := range c.sportMessages {
+		if getString(sm, "sport") == sport {
+			return sm
+		}
+	}
+	return nil
+}
+
+// parseTime reads an RFC3339 timestamp from m[key].
+func parseTime(m map[string]any, key string) (time.Time, bool) {
+	s, ok := m[key].(string)
+	if !ok {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+func getString(m map[string]any, key string) string {
+	if s, ok := m[key].(string); ok {
+		return s
+	}
+	return ""
 }
 
 // getFieldDescription finds the matching FieldDescription for a developer field.
@@ -386,7 +495,6 @@ func castValue(val proto.Value, baseType basetype.BaseType) proto.Value {
 	return val
 }
 
-// --- NEW HELPER FUNCTION ---
 // getFloat safely gets a float64 from a map[string]any,
 // converting from any numeric type.
 func getFloat(m map[string]any, key string) (float64, bool) {
@@ -426,14 +534,21 @@ func getFloat(m map[string]any, key string) (float64, bool) {
 	}
 }
 
-// --- FINAL-FINAL enrichLaps FUNCTION ---
-func (c *Converter) enrichLaps() {
-	if len(c.recordMessages) == 0 || len(c.lapMessages) == 0 {
+// enrichLaps decorates one leg's laps with per-lap averages derived from that
+// leg's records, then rolls leg-level totals onto the leg's session. It operates
+// only on the records and laps belonging to this leg so a multisport file's legs
+// never bleed into each other.
+func (c *Converter) enrichLaps(session map[string]any, laps, records []map[string]any, sport string) {
+	if len(records) == 0 || len(laps) == 0 {
 		return
 	}
 
-	for i := range c.lapMessages {
-		lap := c.lapMessages[i]
+	var sessionTotalMovingTime float64
+	var sessionTotalStrokes float64
+	var sessionAvgRunningPower float64
+
+	for i := range laps {
+		lap := laps[i]
 
 		lapStartTimeStr, ok := lap["start_time"].(string)
 		if !ok {
@@ -479,14 +594,19 @@ func (c *Converter) enrichLaps() {
 			"step_length":          {newKey: "avg_garmin_step_length"},
 
 			// Cycling Dynamics (add more as needed)
-			// "left_torque_effectiveness":  {newKey: "avg_left_torque_effectiveness"},
-			// "right_torque_effectiveness": {newKey: "avg_right_torque_effectiveness"},
-			// "left_pco":                   {newKey: "avg_left_pco"},
-			// "right_pco":                  {newKey: "avg_right_pco"},
+			"left_torque_effectiveness":  {newKey: "avg_left_torque_effectiveness"},
+			"right_torque_effectiveness": {newKey: "avg_right_torque_effectiveness"},
+			"left_pco":                   {newKey: "avg_left_pco"},
+			"right_pco":                  {newKey: "avg_right_pco"},
+
+			// --- SWIM FIELDS ---
+			// Note: Cadence is used for both swim and bike/run in records
+			"cadence": {newKey: "avg_cadence"},
 		}
 
-		// --- 3. Iterate all records ---
-		for _, record := range c.recordMessages {
+		// --- 3. Iterate this leg's records ---
+		var lapMovingTime float64 // We need to calculate this for swims
+		for _, record := range records {
 			recordTimeStr, ok := record["timestamp"].(string)
 			if !ok {
 				continue
@@ -495,14 +615,19 @@ func (c *Converter) enrichLaps() {
 			if err != nil {
 				continue
 			}
-
 			if (recordTime.After(lapStartTime) || recordTime.Equal(lapStartTime)) && recordTime.Before(lapEndTime) {
 				// --- 4. Aggregate data! ---
 				for key, data := range aggMap {
 					if value, ok := getFloat(record, key); ok {
+						if sport == "swimming" && key == "cadence" && value == 0 {
+							continue // Don't count 0 spm
+						}
 						data.acc.sum += value
 						data.acc.count++
 					}
+				}
+				if speed, ok := getFloat(record, "speed"); ok && speed > 0 {
+					lapMovingTime += 1 // Assumes 1-second records
 				}
 			}
 		} // end for recordMessages
@@ -513,5 +638,43 @@ func (c *Converter) enrichLaps() {
 				lap[data.newKey] = data.acc.sum / float64(data.acc.count)
 			}
 		}
-	} // end for lapMessages
+
+		if sport == "swimming" {
+			// Overwrite moving time with our calculated value
+			lap["total_moving_time"] = lapMovingTime
+			sessionTotalMovingTime += lapMovingTime // Add to session total
+
+			if avgCadence, ok := getFloat(lap, "avg_cadence"); ok && lapMovingTime > 0 {
+				// total_strokes = strokes_per_minute * minutes_moving
+				lapTotalStrokes := avgCadence * (lapMovingTime / 60.0)
+				lap["total_strokes"] = int(lapTotalStrokes)
+				sessionTotalStrokes += lapTotalStrokes // Add to session total
+
+				// Now calculate stroke distance
+				if lapDist, ok := getFloat(lap, "total_distance"); ok && lapTotalStrokes > 0 {
+					lap["avg_stroke_distance"] = lapDist / lapTotalStrokes
+				}
+			}
+		}
+
+		if sport == "running" {
+			// for running accumulate avg running power
+			if avgRuningPower, ok := getFloat(lap, "avg_stryd_power"); ok && avgRuningPower > 0 {
+				sessionAvgRunningPower += avgRuningPower
+			}
+		}
+
+	} // end for laps
+
+	if sport == "swimming" {
+		session["total_moving_time"] = sessionTotalMovingTime
+		session["total_strokes"] = int(sessionTotalStrokes)
+
+		if totalDist, ok := getFloat(session, "total_distance"); ok && sessionTotalStrokes > 0 {
+			session["avg_stroke_distance"] = totalDist / sessionTotalStrokes
+		}
+	}
+	if sport == "running" && len(laps) > 0 {
+		session["avg_running_power"] = sessionAvgRunningPower / float64(len(laps))
+	}
 }
